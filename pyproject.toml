@@ -5,7 +5,7 @@ license = "AGPL-3.0-only"
 dynamic = ["version"]
 requires-python = "==3.13.16"
 dependencies = [
-    "websockets==17.2",
+    "websockets==17.4",
 ]
 
 [project.scripts]
