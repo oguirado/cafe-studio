@@ -301,7 +301,7 @@
     "dockview-vue": "8.4.1",
     "openvue": "1.0.0",
     "@openvue/icons": "1.0.0",
-    "@openvue/themes": "1.0.0"
+    "@openvue/themes": "1.1.1"
   },
   "devDependencies": {
     "electron": "44.9.2",
