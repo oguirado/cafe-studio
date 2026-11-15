@@ -1,0 +1,31 @@
+Café third-party notice
+
+Café's own code is licensed under the GNU Affero General Public License v3.0
+only (AGPL-3.0-only); see LICENSE. The components below keep their own
+licenses, all compatible with AGPL-3.0.
+
+In this repository:
+- A small reference subset from nexu-io/open-design, commit
+  f1a0b60c6cd1c9f5c735ae5645e47244b468e71c, design-systems/openai, under the
+  Apache License, Version 2.0. Its full license and per-file provenance are in
+  ui/src/design/vendor/open-design-openai/LICENSE and PROVENANCE.md. It is an
+  independent curated design reference inspired by OpenAI. It does not
+  identify Café as an OpenAI product or imply affiliation, sponsorship,
+  endorsement, or rights to OpenAI trademarks or proprietary fonts. No font
+  binaries, logos or preview/component assets accompany this subset. Café
+  application font overrides belong in ui/src/design/tokens.cafe.css.
+- The o200k_base tokenizer table from tiktoken, under the MIT License, used
+  only by development checks; see tools/assets/tokenizer/.
+
+In the packaged Windows application:
+- Electron, which includes Chromium, under the MIT License; Chromium's own
+  licenses ship as LICENSES.chromium.html.
+- Vue, dockview and openvue, under the MIT License.
+- The Python runtime, under the Python Software Foundation License.
+- websockets, under the BSD 3-Clause License.
+- The Rust crates serde, serde_json, sha2, tokio and windows, under the MIT
+  License or the Apache License, Version 2.0.
+Their license files are copied into the package.
+
+FFmpeg is not included. Users install it separately; it is licensed by its
+own project.

@@ -1,0 +1,392 @@
+"""Handwritten P05 Rust inventory and bounded-extractor negative oracles."""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+CAPSULE = 'core/src/capsule_registry.rs'
+FILES = ['core/src/authority_auth.rs', 'core/src/authority_journal.rs', 'core/src/capsule_pairing.rs', 'core/src/capsule_registry.rs', 'core/src/capture_frame_pool.rs', 'core/src/capture_health.rs', 'core/src/capture_pipeline.rs', 'core/src/control_intents.rs', 'core/src/discord_windows.rs', 'core/src/ffmpeg_recorder.rs', 'core/src/journal_replay.rs', 'core/src/main.rs', 'core/src/operator_protocol.rs', 'core/src/organizer.rs', 'core/src/python_connector_supervisor.rs', 'core/src/recorder_pacer.rs', 'core/src/runtime_effects.rs', 'core/src/runtime_main.rs', 'core/src/runtime_recording.rs', 'core/src/runtime_service_owner.rs', 'core/src/runtime_storage.rs', 'core/src/runtime_windows_security.rs', 'core/src/windows_auth.rs', 'core/src/windows_graphics_capture.rs', 'core/src/windows_journal_policy.rs', 'core/src/windows_window_registry.rs']
+MODULE_PATHS = {'core/src/authority_auth.rs::windows_auth': 'core/src/windows_auth.rs'}
+# Independently transcribed from reviewed P05 declarations, before extractor execution.
+GOLD = [
+    ('SCHEMA', 14), ('MAX_ENVELOPE_BYTES', 17), ('Clock', 25), ('Role', 102),
+    ('Envelope', 110), ('Command', 122), ('DecodeError', 153), ('decode_envelope', 301),
+    ('Feed', 314), ('Capsule', 323), ('Proposal', 333), ('Snapshot', 344),
+    ('Outcome', 356), ('Receipt', 364), ('Reply', 372), ('Registry', 382),
+    ('Registry::new', 393), ('Registry::snapshot', 405),
+    ('Registry::decode_and_apply', 417), ('Registry::apply', 424),
+]
+JOURNAL_GOLD = [('JOURNAL_SCHEMA', 29), ('MAX_RECORD_BYTES', 32), ('JournalError', 46), ('AppendState', 73), ('Record', 81), ('Pending', 95), ('Pending::state', 101), ('Committed', 109), ('Committed::state', 116), ('Committed::sequence', 120), ('Committed::event_id', 124), ('Committed::record_digest', 128), ('Journal', 239), ('canonical_bytes', 260), ('Journal::open', 656), ('Journal::stage_control', 712), ('Journal::commit', 766), ('Journal::append_control', 809), ('Journal::append_media_intent', 877), ('Journal::publish_media', 918), ('Journal::records', 1000), ('Journal::recovery_status', 1005), ('Journal::interrupted_bytes', 1010)]
+REPLAY_GOLD = [('RecoveryStatus', 21), ('MediaState', 29), ('Recovery', 40), ('recover', 68)]
+WINDOW_GOLD = [('Rect',7),('WindowHandle',11),('WindowView',14),('FixtureWindow',22),('WindowError',29),('WindowRegistry',43),('WindowRegistry::new',46),('WindowRegistry::refresh_fixtures',47),('WindowRegistry::snapshots',85),('WindowRegistry::resolve',86),('WindowRegistry::invalidate_layout',94),('NativeAdapter',246),('NativeAdapter::new',252),('NativeAdapter::enumerate',256)]
+PAIRING_GOLD = [('Crop', 7), ('PairRequest', 16), ('Binding', 31), ('PairingBook', 48), ('PairingBook::new', 55), ('PairingBook::pair', 62), ('PairingBook::bindings', 112), ('PairingBook::current', 116), ('PairingBook::pair_by_executable', 129), ('PairError', 136)]
+HEALTH_GOLD = [('HealthPolicy',9),('BorderStatus',14),('CaptureState',17),('CaptureEvent',23),('HealthError',29),('CaptureHealth',35),('CaptureHealth::new',48),('CaptureHealth::event',65),('CaptureHealth::admit_frame',88),('CaptureHealth::status',122),('admit_content_size',146)]
+POOL_GOLD = [('PoolLimits',18),('BorrowedFrame',28),('PoolError',39),('FramePool',51),('FramePool::new',59),('FramePool::copy_from',89),('FramePool::available',140),('FramePool::in_use',145),('FramePool::capacity',150),('OwnedFrame',170),('OwnedFrame::pixels',182),('OwnedFrame::width',186),('OwnedFrame::height',190),('OwnedFrame::source_stride',195),('OwnedFrame::packed_stride',200),('OwnedFrame::source_time',205)]
+CAPTURE_GOLD = [('NativeSupport', 105), ('CaptureConfig', 114), ('ObservedCaptureConfig', 126), ('ObservedCaptureConfig::resolve_size', 134), ('CaptureError', 146)]
+CAPTURE_PORTABLE_GOLD = [('native_support', 178), ('NativeCapture', 183), ('NativeCapture::start_observed', 189), ('NativeCapture::start', 192), ('NativeCapture::take_latest', 202), ('NativeCapture::content_size', 206), ('NativeCapture::poll_state', 210), ('NativeCapture::border_status', 214), ('NativeCapture::stop', 218)]
+PACER_GOLD = [('PacerProfile', 18), ('PacerProfile::validate', 27), ('PacerProfile::sixty_fps', 46), ('PacerError', 59), ('PacerCounters', 70), ('OutputFrame', 78), ('Pacer', 94), ('Pacer::new', 105), ('Pacer::offer', 119), ('Pacer::skip_late', 154), ('Pacer::select', 172), ('Pacer::counters', 232), ('PreviewCounters', 239), ('PreviewSelector', 250), ('PreviewSelector::new', 265), ('PreviewSelector::observe', 327), ('PreviewSelector::counters', 379)]
+RECORDER_GOLD = [('Encoder', 16), ('Encoder::from_name', 18), ('Encoder::name', 19), ('EncoderUse', 22), ('VideoProfile', 24), ('VideoProfile::validate', 30), ('VideoProfile::frame_bytes', 34), ('RecorderError', 38), ('RecordingState', 40), ('RecorderCounters', 42), ('RecordingPlan', 44), ('RecordingReceipt', 45), ('Preflight', 47), ('Preflight::encoder', 49), ('Preflight::profile', 50), ('Preflight::with_profile', 56), ('preflight', 130), ('Recorder', 161), ('Recorder::start', 183), ('Recorder::start_ready', 196), ('Recorder::enable_late_recovery', 250), ('Recorder::state', 253), ('Recorder::counters', 258), ('Recorder::pacer_counters', 263), ('Recorder::pid', 268), ('Recorder::queue_len', 273), ('Recorder::enable_preview', 280), ('Recorder::preview_counters', 298), ('Recorder::take_preview', 304), ('Recorder::admit', 309), ('Recorder::pace', 345), ('Recorder::begin_pump', 402), ('Recorder::poll_pump', 475), ('Recorder::pump_one', 490), ('Recorder::interrupt', 516), ('Recorder::stop', 523)]
+SOURCE_HASHES = {'core/src/authority_auth.rs': '9244dbb96df97989301cfbd53963b988d4e811e6071a28226417f1b50559aec7', 'core/src/authority_journal.rs': '0b106d9b024934463e6f2387d6c63550700c27fae9269ce13bc800db577482dc', 'core/src/capsule_pairing.rs': '391845424654f2915952e23aa167f44c96620b6f13f4da796d777d0b6d49e849', 'core/src/capsule_registry.rs': '912333e60f264ca586c9d32df4ef9e9b332b2baed15d8a7ce0a565af540413ad', 'core/src/capture_frame_pool.rs': 'f38b4a02e1d73129ed548e0fd0fb315eddf207d728f7b8b4dcda81bcb63f7ce0', 'core/src/capture_health.rs': 'f68bfb3a8ef162bfe3b152acdc5f762d7c6c3ca8f16670a426d5fd8608f203b5', 'core/src/capture_pipeline.rs': '659b6f019c2dcbc462b56b136052a5dba7b3c45f2aa8815b65bd0a1ce1890361', 'core/src/control_intents.rs': '181c2f0edd2a016168e7bf84cff8381254e7b2050bb905c4a47613b1a2c010f3', 'core/src/discord_windows.rs': 'ce8b91730820ef76e90ce23ecfe54ac35573cb8165a35a3b0deadb189282c093', 'core/src/ffmpeg_recorder.rs': '160ede5f7af582ef1f4d5ef5b83525ffb76e814fb21111faf224f4963e88af10', 'core/src/journal_replay.rs': '16a92bb9817ae399055470bc762be738ea5997a6bc5e2130e2eea96d8ecbf720', 'core/src/main.rs': 'aa52d5b66b0781366e31fb3bdb0bde1744f1d0a183676fc5d64ea622d7830377', 'core/src/operator_protocol.rs': 'a5032151e79428fcf9e1c01e5d45172601394657a06c66ebbdb48f0370a42498', 'core/src/organizer.rs': '9e3638b73b8ac51ec053b52f50b544b81345ca51a983b70e14ab9f2232c14d44', 'core/src/python_connector_supervisor.rs': '85d312c5b1fd148bba9a6e829b7e75d81572696398ea1e09702cedf67a6c6de4', 'core/src/recorder_pacer.rs': '6edba778ac3129dd00f6af8220b21e0f932a9cb7a4c9089fc4c78f0ae0231b6d', 'core/src/runtime_effects.rs': '2d7a5d547d624609398f26f8165614176c60e115d18c0326dc4f22c4c6fff570', 'core/src/runtime_main.rs': '06cf714953a6bbc70b53fbd485d1314abc88fb4b77de634fdf14f47416e331e4', 'core/src/runtime_recording.rs': '02d49d902d8106beb091fb102c44324c7b32aa852be3fdc2f9aec501db8dc462', 'core/src/runtime_service_owner.rs': 'b9e628caac3a161ab20503751783b3f0d0eff24ed2bce63e5bef195c9755a6f8', 'core/src/runtime_storage.rs': 'a394099b15d5846cd4d70e81ca1144baaa88145e6d79044ecd596882c5fedef5', 'core/src/runtime_windows_security.rs': '63e4402df9e1ef76cac4e901e3b6b9142cecb7ad8a82b732b18b5b0a58f59c21', 'core/src/windows_auth.rs': '1450aba474b5ec88dad99c65fe8317c8a046f7c8082d1e078c375f2d059a0ebd', 'core/src/windows_graphics_capture.rs': '7599c8cc38b195d31992d528826d14fd5b33304c545d0576ec0f3c2cac461f47', 'core/src/windows_journal_policy.rs': '3e6087d78cc62d14c1d2586aefe90a44de70cc386cd47f366c2b2d2fb8f80ad9', 'core/src/windows_window_registry.rs': '1b8f67f7d3b1da1590505b84340ea61608e16b4665011874dac03c804f38c25b'}
+SPEC = importlib.util.spec_from_file_location('cafe_rust_extractor', ROOT / 'tools/extract_rust.py')
+x = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = x
+SPEC.loader.exec_module(x)
+QSPEC = importlib.util.spec_from_file_location('cafe_rust_qualification', ROOT / 'tools/qualify_cafe_router.py')
+q = importlib.util.module_from_spec(QSPEC)
+sys.modules[QSPEC.name] = q
+QSPEC.loader.exec_module(q)
+
+
+def expected_gold():
+    return [{'path': CAPSULE, 'symbol': 'cafe_core::capsule_registry::' + name,
+             'name': name.split('::')[-1], 'line': line, 'cfg': []} for name, line in GOLD]
+
+
+AUTH_GOLD = [('MAX_LINE', 11), ('read_frame', 52), ('write_frame', 80), ('make_frame', 85), ('validate_authority_frame', 91), ('validate_connector_frame', 100), ('lease_frame', 104), ('hmac_sha256', 111), ('BrokerAuthority', 223), ('BrokerAuthority::status', 322)]
+PIPELINE_GOLD = [('FrameSource', 19), ('FrameSource::take_latest', 21), ('FrameSource::state', 23), ('FrameSource::stop', 25), ('NativeSource', 29), ('NativeSource::new', 34), ('Tick', 55), ('PipelineError', 63), ('CapturePipeline', 70), ('CapturePipeline::new', 80), ('CapturePipeline::new_live', 92), ('CapturePipeline::tick', 105), ('CapturePipeline::tick_nonblocking', 115), ('CapturePipeline::stop', 173), ('CapturePipeline::abort', 200), ('CapturePipeline::recorder_state', 221), ('CapturePipeline::recorder_counters', 226)]
+
+def expected_inventory():
+    # All rows originate in manually transcribed tuples, never parsed source output.
+    def rows(path, module, pairs):
+        return [{'path': path, 'symbol': 'cafe_core::' + module + '::' + name,
+                 'name': name.split('::')[-1], 'line': line, 'cfg': []} for name, line in pairs]
+    return {**{path:[] for path in FILES},
+            'core/src/authority_auth.rs': sorted(rows('core/src/authority_auth.rs','authority_auth',AUTH_GOLD)+[dict(row,cfg=['any(unix,windows)']) for row in rows('core/src/authority_auth.rs','authority_auth',[('BrokerAuthority::start',226)])],key=lambda row:(row['line'],row['symbol'])),
+            'core/src/python_connector_supervisor.rs': rows('core/src/python_connector_supervisor.rs','python_connector_supervisor',[('ConnectorSupervisor',27),('ConnectorSupervisor::spawn',42),('ConnectorSupervisor::status',132),('ConnectorSupervisor::exchange',155),('ConnectorSupervisor::lease',206),('ConnectorSupervisor::restart',229),('ConnectorSupervisor::stop',243)]),
+            'core/src/capture_pipeline.rs': rows('core/src/capture_pipeline.rs','capture_pipeline',PIPELINE_GOLD),
+            'core/src/recorder_pacer.rs': rows('core/src/recorder_pacer.rs','recorder_pacer',PACER_GOLD),
+            'core/src/ffmpeg_recorder.rs': rows('core/src/ffmpeg_recorder.rs','ffmpeg_recorder',RECORDER_GOLD),
+            'core/src/windows_journal_policy.rs': [],
+            'core/src/authority_journal.rs': rows('core/src/authority_journal.rs', 'authority_journal', JOURNAL_GOLD),
+            CAPSULE: expected_gold(),
+            'core/src/journal_replay.rs': rows('core/src/journal_replay.rs', 'journal_replay', REPLAY_GOLD),
+            'core/src/main.rs': [],
+            'core/src/capture_health.rs': rows('core/src/capture_health.rs','capture_health',HEALTH_GOLD),
+            'core/src/capture_frame_pool.rs': rows('core/src/capture_frame_pool.rs','capture_frame_pool',POOL_GOLD),
+            'core/src/windows_graphics_capture.rs': rows('core/src/windows_graphics_capture.rs','windows_graphics_capture',CAPTURE_GOLD) + [dict(row,cfg=['not(windows)']) for row in rows('core/src/windows_graphics_capture.rs','windows_graphics_capture',CAPTURE_PORTABLE_GOLD)],
+            'core/src/capsule_pairing.rs': rows('core/src/capsule_pairing.rs','capsule_pairing',PAIRING_GOLD),
+            'core/src/windows_window_registry.rs': [dict(row,cfg=['not(windows)'] if 'NativeAdapter' in row['symbol'] else []) for row in rows('core/src/windows_window_registry.rs','windows_window_registry',WINDOW_GOLD)]}
+
+
+class TestRustExtraction(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # Canonical spelling: the extractor resolves its root, so read guards
+        # keyed on an alias (Windows 8.3 short name, symlinked TMPDIR) break.
+        self.root = Path(self.tmp.name).resolve(strict=True)
+        (self.root / 'core/src').mkdir(parents=True)
+        self.inventory = ['core/src/main.rs']
+
+    def source(self, text):
+        (self.root / 'core/src/main.rs').write_text(text, encoding='utf-8')
+
+    def extract(self, text, profile=None):
+        self.source(text)
+        return x.extract(self.root, self.inventory, self.inventory, profile)['files'][0]['symbols']
+
+    def test_builtin_test_attribute_in_inactive_test_module_preserves_source_surface(self):
+        source='#[cfg(test)]\nmod tests { #[test] fn check() {} }\npub fn live() {}\n'
+        rows=self.extract(source, {'windows':False,'unix':True,'test':False,'target_os':'linux'})
+        self.assertEqual(rows, [{'path':self.inventory[0], 'symbol':'cafe_core::live', 'name':'live', 'line':3, 'cfg':[]}])
+
+    def test_unknown_or_parameterized_test_attribute_still_abstains(self):
+        for attribute in ['custom_codegen', 'test(extra)']:
+            source=f'#[cfg(test)]\nmod tests {{ #[{attribute}] fn check() {{}} }}\npub fn live() {{}}\n'
+            with self.subTest(attribute=attribute),self.assertRaises(x.ExtractionError) as error:
+                self.extract(source, {'windows':False,'unix':True,'test':False,'target_os':'linux'})
+            self.assertEqual(error.exception.code,'unsupported_attribute')
+
+    def test_handwritten_current_public_inventory(self):
+        inventory, _source = q.load_inventory(ROOT, os.environ.get('CAFE_ROUTER_INVENTORY'))
+        report = x.extract(ROOT, FILES, inventory, {'windows':False,'unix':True,'test':False,'target_os':'linux'}, module_paths=MODULE_PATHS)
+        self.assertEqual(report['schema'], 'cafe.rust-surface.v1')
+        self.assertEqual(report['crate'], 'cafe_core')
+        self.assertEqual(report['cfg_profile'], {'windows':False,'unix':True,'test':False,'target_os':'linux'})
+        self.assertEqual({v['path']: v['symbols'] for v in report['files']}, expected_inventory())
+        self.assertEqual({v['path']: v['source_sha256'] for v in report['files']}, SOURCE_HASHES)
+        for row in [row for file in report['files'] for row in file['symbols']]:
+            line = (ROOT / row['path']).read_text().splitlines()[row['line'] - 1]
+            self.assertIn(row['name'], line)
+
+    def test_removed_public_function_breaks_manual_gold(self):
+        for rel in FILES:
+            (self.root / rel).write_bytes((ROOT / rel).read_bytes())
+        p = self.root / CAPSULE
+        before = p.read_text()
+        self.assertEqual(before.count('pub fn decode_envelope('), 1)
+        p.write_text(before.replace('pub fn decode_envelope(', 'fn decode_envelope(', 1))
+        report = x.extract(self.root, FILES, FILES, {'windows':False,'unix':True,'test':False,'target_os':'linux'}, module_paths=MODULE_PATHS)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(next(v for v in report['files'] if v['path'] == CAPSULE)['symbols'], expected_gold())
+        self.assertNotEqual(next(v for v in report['files'] if v['path'] == CAPSULE)['source_sha256'], SOURCE_HASHES[CAPSULE])
+
+    def test_comment_and_string_lookalikes_not_extracted(self):
+        text = '''// pub fn line_fake() {}
+/* pub struct BlockFake; /* pub enum NestedFake {} */ */
+const TEXT: &str = "pub fn string_fake() { \\\" }";
+const RAW: &str = r###"pub fn raw_fake() { /* } */"###;
+const BYTES: &[u8] = br##"pub mod byte_fake {}"##;
+const CSTR: &std::ffi::CStr = c"pub trait Cfake {}";
+const LETTER: char = '{';
+pub fn real<'a>(value: &'a str) { let _ = 'x'; }
+'''
+        rows = self.extract(text)
+        self.assertEqual(rows, [{'path': self.inventory[0], 'symbol': 'cafe_core::real',
+                                'name': 'real', 'line': 8, 'cfg': []}])
+
+    def test_bounded_single_generic_and_lifetime_impls(self):
+        text = """pub trait Source { fn take(&self); }
+pub struct Pipe<S> { source: S }
+impl<S: Source> Pipe<S> { pub fn tick(&self) {} }
+struct Visitor;
+impl<'de> serde::de::Visitor<'de> for Visitor { fn visit(&self) {} }
+pub struct Dispatch<'a> { value: &'a str }
+impl Dispatch<'_> { pub fn complete(&self) {} }
+"""
+        self.assertEqual([(row['symbol'], row['line']) for row in self.extract(text)], [
+            ('cafe_core::Source', 1), ('cafe_core::Source::take', 1),
+            ('cafe_core::Pipe', 2), ('cafe_core::Pipe::tick', 3),
+            ('cafe_core::Dispatch', 6), ('cafe_core::Dispatch::complete', 7)])
+
+    def test_private_trait_members_are_not_public_inventory(self):
+        rows = self.extract('trait Private { fn hidden(&self); } pub trait Visible { type Item; const LIMIT: u32; fn show(&self); }')
+        self.assertEqual([row['symbol'] for row in rows], ['cafe_core::Visible', 'cafe_core::Visible::Item', 'cafe_core::Visible::LIMIT', 'cafe_core::Visible::show'])
+
+    def test_unmodelled_generic_owners_abstain(self):
+        for text in [
+            'pub struct X<T>(T); impl X<u32> { pub fn same() {} }',
+            'pub struct X<T>(T); impl<T,U> X<T> { pub fn same() {} }',
+            'pub struct X<T>(T); impl<T> X<T> where T: Copy { pub fn same() {} }',
+            'pub struct X<T>(T); impl<const N: usize> X<N> { pub fn same() {} }',
+            'pub struct X<T>(T); impl<T: Bound<Item=T>> X<T> { pub fn same() {} }',
+            'impl module::X { pub fn same() {} }',
+        ]:
+            with self.subTest(text=text), self.assertRaises(x.ExtractionError):
+                self.extract(text)
+
+    def test_macro_generated_public_surface_abstains(self):
+        for text in ['macro_rules! expose { () => { pub fn hidden() {} } } expose!();',
+                     'fn private() { macro_rules! expose { () => { pub struct Hidden; } } }',
+                     'some_expander! { pub struct Hidden; }']:
+            with self.subTest(text=text), self.assertRaises(x.ExtractionError):
+                self.extract(text)
+
+    def test_glob_and_named_reexports_abstain(self):
+        for text in ['pub use x::*;', 'pub use x::{Thing, *};', 'pub use x::Thing;']:
+            with self.subTest(text=text), self.assertRaises(x.ExtractionError):
+                self.extract(text)
+
+    def test_nonlisted_source_is_never_read(self):
+        self.source('pub fn allowed() {}')
+        rogue = self.root / 'core/src/unlisted.rs'
+        rogue.write_bytes(b'\xffmacro_rules! rogue { () => { pub fn hidden() {} } }')
+        original = Path.read_bytes
+        reads = []
+        def guarded(path):
+            reads.append(path.relative_to(self.root).as_posix())
+            if path == rogue:
+                raise AssertionError('nonlisted source read')
+            return original(path)
+        with mock.patch.object(Path, 'read_bytes', guarded):
+            rows = x.extract(self.root, self.inventory, self.inventory + ['core/src/unlisted.rs'])
+        self.assertEqual(reads, self.inventory)
+        self.assertEqual([v['name'] for v in rows['files'][0]['symbols']], ['allowed'])
+        self.source('mod unlisted;')
+        with mock.patch.object(Path, 'read_bytes', guarded), self.assertRaises(x.ExtractionError):
+            x.extract(self.root, self.inventory, self.inventory + ['core/src/unlisted.rs'])
+        self.assertNotIn('core/src/unlisted.rs', reads)
+
+    def test_alias_root_still_guards_nonlisted_source(self):
+        self.source('pub fn allowed() {}')
+        rogue = self.root / 'core/src/unlisted.rs'
+        rogue.write_bytes(b'\xffmacro_rules! rogue { () => { pub fn hidden() {} } }')
+        holder = tempfile.TemporaryDirectory(); self.addCleanup(holder.cleanup)
+        alias = Path(holder.name) / 'alias-root'
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+        except OSError:
+            # Unprivileged Windows: the raw temp spelling is the host alias (8.3 short name on runners).
+            alias = Path(self.tmp.name)
+        original = Path.read_bytes
+        reads = []
+        def guarded(path):
+            # Keyed on the canonical root: any read through the alias spelling raises here.
+            reads.append(path.relative_to(self.root).as_posix())
+            if path.resolve() == rogue:
+                raise AssertionError('nonlisted source read')
+            return original(path)
+        with mock.patch.object(Path, 'read_bytes', guarded):
+            rows = x.extract(alias, self.inventory, self.inventory + ['core/src/unlisted.rs'])
+        self.assertEqual(reads, self.inventory)
+        self.assertEqual([v['name'] for v in rows['files'][0]['symbols']], ['allowed'])
+        self.source('mod unlisted;')
+        with mock.patch.object(Path, 'read_bytes', guarded), self.assertRaises(x.ExtractionError):
+            x.extract(alias, self.inventory, self.inventory + ['core/src/unlisted.rs'])
+        self.assertNotIn('core/src/unlisted.rs', reads)
+
+    def test_sorted_explicit_safe_versioned_list_required(self):
+        self.source('pub fn ok() {}')
+        bad = [[], [self.inventory[0]] * 2, ['../escape.rs'], ['/absolute.rs'],
+               ['core/src/./main.rs'], ['core/src//main.rs'], ['core/src/main.txt'],
+               ['core/src/main.rs', 'core/src/a.rs']]
+        for paths in bad:
+            with self.subTest(paths=paths), self.assertRaises(x.ExtractionError):
+                x.extract(self.root, paths, self.inventory)
+        with self.assertRaises(x.ExtractionError):
+            x.extract(self.root, self.inventory, [])
+        target = self.root / 'core/src/alias.rs'
+        target.symlink_to(self.root / self.inventory[0])
+        with self.assertRaises(x.ExtractionError):
+            x.extract(self.root, ['core/src/alias.rs', 'core/src/main.rs'],
+                      ['core/src/alias.rs', 'core/src/main.rs'])
+
+    def test_source_bytes_hashed_before_strict_decode(self):
+        p = self.root / self.inventory[0]
+        p.write_bytes(b'\xffpub fn bad() {}')
+        real = hashlib.sha256
+        with mock.patch.object(x.hashlib, 'sha256', wraps=real) as hashed:
+            with self.assertRaises(x.ExtractionError) as error:
+                x.extract(self.root, self.inventory, self.inventory)
+            self.assertEqual(error.exception.code, 'invalid_utf8')
+            hashed.assert_called_once_with(p.read_bytes())
+        raw = b'// bytes\r\npub fn fine() {}\r\n'
+        p.write_bytes(raw)
+        report = x.extract(self.root, self.inventory, self.inventory)
+        self.assertEqual(report['files'][0]['source_sha256'], real(raw).hexdigest())
+        self.assertEqual(report['files'][0]['symbols'][0]['line'], 2)
+
+    def test_cfg_evaluated_only_with_explicit_profile(self):
+        text = '#[cfg(all(unix, not(test), target_os = "linux"))]\npub fn active() {}\n#[cfg(test)]\npub fn inactive() {}\n'
+        rows = self.extract(text, {'unix': True, 'test': False, 'target_os': 'linux'})
+        self.assertEqual([v['name'] for v in rows], ['active'])
+        self.assertEqual(rows[0]['cfg'], ['all(unix,not(test),target_os="linux")'])
+        for source, profile in [(text, {}), ('#[cfg(unknown)] pub fn nope() {}', {}),
+                                ('#[cfg(any(unix, mystery))] pub fn nope() {}', {'unix': True}),
+                                ('#[cfg_attr(test, path="other.rs")] mod child;', {'test': False}),
+                                ('#[cfg(unsupported(test))] pub fn nope() {}', {'test': True})]:
+            with self.subTest(source=source), self.assertRaises(x.ExtractionError):
+                self.extract(source, profile)
+        rows = self.extract('#[cfg(feature="a")] pub const VALUE: u8 = 1;', {'feature': ['a', 'b']})
+        self.assertEqual(rows[0]['name'], 'VALUE')
+
+    def test_qualified_inline_modules_impl_and_item_kinds(self):
+        text = '''pub mod outer {
+ pub struct Thing;
+ pub enum Choice { A }
+ pub trait Interface { fn implicit(); }
+ pub type Alias = Thing;
+ pub const VALUE: u8 = 1;
+ impl Thing { pub fn new() -> Self { Self } fn private() {} }
+ pub(crate) fn restricted() {}
+}
+'''
+        rows = self.extract(text)
+        self.assertEqual([(v['symbol'], v['line']) for v in rows], [
+            ('cafe_core::outer', 1), ('cafe_core::outer::Thing', 2),
+            ('cafe_core::outer::Choice', 3), ('cafe_core::outer::Interface', 4), ('cafe_core::outer::Interface::implicit', 4),
+            ('cafe_core::outer::Alias', 5), ('cafe_core::outer::VALUE', 6),
+            ('cafe_core::outer::Thing::new', 7)])
+
+    def test_private_static_is_not_public_and_unsupported_static_refuses(self):
+        rows = self.extract('static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);\npub fn visible() {}')
+        self.assertEqual([row['symbol'] for row in rows], ['cafe_core::visible'])
+        for source in ['pub static EXPORTED: u8 = 1;', 'static mut MUTABLE: u8 = 1;',
+                       'static BLOCK: u8 = { 1 };']:
+            with self.subTest(source=source), self.assertRaises(x.ExtractionError):
+                self.extract(source)
+
+    def test_module_graph_and_inherited_cfg(self):
+        self.source('#[cfg(enabled)] mod child;')
+        child = 'core/src/child.rs'
+        (self.root / child).write_text('pub fn leaf() {}')
+        paths = [child, self.inventory[0]]
+        rows = x.extract(self.root, paths, paths, {'enabled': True})['files'][0]['symbols']
+        self.assertEqual(rows, [{'path': child, 'symbol': 'cafe_core::child::leaf',
+                                'name': 'leaf', 'line': 1, 'cfg': ['enabled']}])
+        self.assertEqual(x.extract(self.root, paths, paths, {'enabled': False})['files'][0]['symbols'], [])
+        self.source('fn root() {}')
+        with self.assertRaises(x.ExtractionError):
+            x.extract(self.root, paths, paths)
+        self.source('mod child;')
+        other = 'core/src/child/mod.rs'
+        (self.root / other).parent.mkdir()
+        (self.root / other).write_text('')
+        with self.assertRaises(x.ExtractionError):
+            x.extract(self.root, sorted(paths + [other]), sorted(paths + [other]))
+
+    def test_unsupported_and_malformed_syntax_refuses(self):
+        for text in ['#[path="elsewhere.rs"] mod child;', '#[expand] pub struct Hidden;',
+                     '#[derive(Custom)] pub struct Hidden;', 'impl<const N: usize> Generic<N> { pub fn f() {} }',
+                     'pub fn broken() {', '/* unterminated', 'pub const S: &str = "unterminated',
+                     'pub static VALUE: u8 = 1;', 'pub union U { x: u8 }']:
+            with self.subTest(text=text), self.assertRaises(x.ExtractionError):
+                self.extract(text)
+
+    def test_disabled_private_extern_is_bounded_and_active_or_unknown_refuses(self):
+        text = '#[cfg(windows)] unsafe extern "system" fn callback() { let s="pub fn fake() {}"; }\npub fn actual() {}'
+        rows = self.extract(text, {'windows': False})
+        self.assertEqual([r['name'] for r in rows], ['actual'])
+        for profile in [{}, {'windows': True}]:
+            with self.subTest(profile=profile), self.assertRaises(x.ExtractionError): self.extract(text, profile)
+        with self.assertRaises(x.ExtractionError): self.extract('#[cfg(windows)] pub extern "system" fn hidden() {}', {'windows': False})
+
+    def test_cli_missing_and_malformed_module_maps_abstain(self):
+        cfg=self.root/'cfg.json';cfg.write_text(json.dumps({'windows':False,'unix':True,'test':False,'target_os':'linux'}))
+        mapping=self.root/'modules.json'
+        base=[sys.executable,'-B','tools/extract_rust.py','--cfg-profile',str(cfg),'--files',*FILES]
+        if os.environ.get('CAFE_ROUTER_INVENTORY'):base+=['--inventory',os.environ['CAFE_ROUTER_INVENTORY']]
+        for value in ['missing','null','[]','{"core/src/authority_auth.rs::windows_auth":"../escape.rs"}']:
+            command=list(base)
+            if value!='missing':mapping.write_text(value);command+=['--module-paths',str(mapping)]
+            with self.subTest(value=value):
+                result=subprocess.run(command,cwd=ROOT,capture_output=True)
+                self.assertEqual(result.returncode,2)
+                self.assertEqual(result.stdout,b'')
+                self.assertIn('error',json.loads(result.stderr))
+
+    def test_cli_determinism_and_source_hashes(self):
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        cfg = self.root / 'cfg.json'; cfg.write_text('{"windows":false,"unix":true,"test":false,"target_os":"linux"}')
+        mapping = self.root / 'modules.json'; mapping.write_text(json.dumps(MODULE_PATHS))
+        command = [sys.executable, '-B', 'tools/extract_rust.py', '--cfg-profile', str(cfg), '--module-paths', str(mapping), '--files', *FILES]
+        snapshot = os.environ.get('CAFE_ROUTER_INVENTORY')
+        if snapshot:
+            command += ['--inventory', snapshot]
+        runs = [subprocess.run(command, cwd=ROOT, env=env, capture_output=True) for _ in range(2)]
+        self.assertEqual([v.returncode for v in runs], [0, 0], runs[0].stderr.decode())
+        self.assertEqual(runs[0].stdout, runs[1].stdout)
+        self.assertEqual(runs[0].stderr, b'')
+        report = json.loads(runs[0].stdout)
+        self.assertEqual({v['path']: v['source_sha256'] for v in report['files']}, SOURCE_HASHES)
+        self.assertTrue(runs[0].stdout.endswith(b'\n'))
+
+    def test_rust_qualification_requires_actual_passing_nonempty_test(self):
+        selection = 'tests/bootstrap/test_extract_rust.py'
+        for check in [q.Check(selection, True, 0, 1), q.Check(selection, False, 1, 1),
+                      q.Check(selection, False, 0, 0)]:
+            def run(root, directory, pattern):
+                return check if pattern == 'test_extract_rust.py' else q.Check(pattern, True, 0, 1)
+            with self.subTest(check=check), mock.patch.object(q, 'run_selection', side_effect=run) as invoked, \
+                    mock.patch.object(q, 'load_inventory', return_value=(['fixture'], 'fixture')), \
+                    mock.patch.object(q, 'check_ownership', return_value=q.Check('ownership', True)):
+                legs, source = q.collect(self.root)
+                report = q.summarize(legs, source)
+                q.validate_report(report, legs)
+                row = report['legs']['extractor_rust']
+                self.assertTrue(row['implemented'])
+                self.assertEqual(row['status'], 'pass' if check.passed else 'fail')
+                self.assertEqual(report['verdict'], 'router available (uncalibrated)' if check.passed else 'router unavailable')
+                self.assertEqual(q.exit_code(legs), 0 if check.passed else 1)
+                invoked.assert_any_call(self.root, 'tests/bootstrap', 'test_extract_rust.py')
+
+
+if __name__ == '__main__':
+    unittest.main()

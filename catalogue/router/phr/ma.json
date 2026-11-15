@@ -1,0 +1,1 @@
+{"make frame":[25,44],"max buckets":[31],"max entries":[36],"max envelope bytes":[49],"max event line":[33],"max file bytes":[26,36],"max files":[33],"max limit":[31],"max line":[25,41,44],"max line bytes":[26,36],"max message rate buckets":[31],"max record bytes":[46],"max request":[33],"max response":[33],"max rows":[26,36],"max scan bytes":[33]}

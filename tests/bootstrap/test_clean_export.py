@@ -1,0 +1,137 @@
+"""Clean-export selection and hook rejection contrasts, separate from real CI evidence."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import re
+import tomllib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'tools'))
+import ci_support as ci
+import clean_export_test as export
+import install_pre_push as installer
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from host_shell import run_bash
+
+
+class TestCleanExport(unittest.TestCase):
+ def setUp(self):
+  self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)/'repo';self.root.mkdir();self.names=ci.prepared_inventory(ROOT)
+  for name in self.names:
+   p=self.root/name;p.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(ROOT/name,p)
+ def test_exact_selected_files_only_and_cleanup_on_success(self):
+  (self.root/'local').mkdir();(self.root/'local/ignored.json').write_text('ignored')
+  seen=[]
+  def profile(root,names):
+   seen.append(root)
+   self.assertEqual(names,self.names);self.assertFalse((root/'local').exists());self.assertFalse((root/'.git').exists())
+   self.assertEqual(ci.tree_digest(root,names),ci.tree_digest(self.root,self.names))
+   return {'status':'pass','records':[]}
+  with mock.patch.dict(os.environ,{'CAFE_PREPARED_INVENTORY_JSON':json.dumps(self.names)}),mock.patch.object(export,'provision_node_modules'),mock.patch.object(export,'run_profile',side_effect=profile):result=export.clean_export(self.root)
+  self.assertEqual(result['mode'],'clean-export test');self.assertIn('PENDING',result['literal_clean_clone']);self.assertTrue(result['cleanup']);self.assertFalse(seen[0].exists())
+ def test_export_cleanup_even_when_gate_raises(self):
+  seen=[]
+  def fail(root,names):seen.append(root);raise ValueError('injected_gate_failure')
+  with mock.patch.dict(os.environ,{'CAFE_PREPARED_INVENTORY_JSON':json.dumps(self.names)}),mock.patch.object(export,'provision_node_modules'),mock.patch.object(export,'run_profile',side_effect=fail),self.assertRaises(ValueError):export.clean_export(self.root)
+  self.assertFalse(seen[0].exists())
+ def test_unknown_or_empty_profile_is_not_pass(self):
+  with mock.patch.object(export,'ci_profile',return_value=[]),self.assertRaises(ValueError):export.run_profile(self.root,self.names)
+  with mock.patch.object(export,'ci_profile',return_value=['python3 -B tools/run_ci.py --invented rust']),self.assertRaises(ValueError):export.run_profile(self.root,self.names)
+ def test_hook_installer_refuses_external_path_and_conflicting_hook(self):
+  (self.root/'.git/hooks').mkdir(parents=True)
+  result=mock.Mock(stdout='../external/pre-push\n')
+  with mock.patch.object(installer.subprocess,'run',return_value=result),self.assertRaises(ValueError):installer.install(self.root)
+  target=self.root/'.git/hooks/pre-push';target.write_text('previous operator hook\n');result.stdout='.git/hooks/pre-push\n'
+  with mock.patch.object(installer.subprocess,'run',return_value=result),self.assertRaises(ValueError):installer.install(self.root)
+  self.assertEqual(target.read_text(),'previous operator hook\n')
+ def test_hook_rejects_real_credential_before_missing_clone_receipt(self):
+  token='gh'+'p_'+secrets.token_hex(18);(self.root/'README.md').write_text('Synthetic security contrast: '+token+'\n')
+  env=ci.source_environment(self.root,self.names)
+  # Actual product hook under the owned host Bash (Git Bash on Windows, never System32/WSL); bare python3 -> current venv.
+  result=run_bash(['tools/hooks/pre-push'],python3_alias=True,cwd=self.root,env=env,capture_output=True,text=True,timeout=30)
+  self.assert_credential_rejection(result,token)
+ def assert_credential_rejection(self,result,token):
+  self.assertNotEqual(result.returncode,0)
+  self.assertTrue(result.stdout.strip(),'hook produced no JSON: rc=%s stderr=%r'%(result.returncode,result.stderr[-400:]))
+  data=json.loads(result.stdout);self.assertEqual(data['status'],'fail')
+  self.assertIn('credential',{row['rule'] for row in data['findings']})
+  self.assertNotIn('clean-clone',result.stdout);self.assertNotIn(token,result.stdout+result.stderr)
+ def test_hook_contrast_wrong_interpreter_or_empty_output_fails(self):
+  token='gh'+'p_'+secrets.token_hex(18);(self.root/'README.md').write_text('Synthetic security contrast: '+token+'\n')
+  for output in ['','not json']:
+   with self.subTest(output=output),self.assertRaises((self.failureException,ValueError)):self.assert_credential_rejection(subprocess.CompletedProcess([],1,output,''),token)
+  # Same actual hook, but python3 unresolvable: must not count as a credential rejection.
+  empty=Path(self.temp.name)/'empty-path';empty.mkdir()
+  env=dict(ci.source_environment(self.root,self.names),PATH=str(empty))
+  result=run_bash(['tools/hooks/pre-push'],cwd=self.root,env=env,capture_output=True,text=True,timeout=30)
+  with self.assertRaises((self.failureException,ValueError)):self.assert_credential_rejection(result,token)
+  # Receipt-ordering contrast: without a credential the hook passes the lint and stops at the clean-clone receipt.
+  (self.root/'README.md').write_bytes((ROOT/'README.md').read_bytes())
+  clean=run_bash(['tools/hooks/pre-push'],python3_alias=True,cwd=self.root,env=ci.source_environment(self.root,self.names),capture_output=True,text=True,timeout=30)
+  self.assertNotEqual(clean.returncode,0)
+  self.assertIn('clean-clone',clean.stdout)
+
+
+ def test_git_inventory_cache_is_ignored_directory_and_inventory_stays_exact(self):
+  source=self.root/'node_modules/typescript';source.mkdir(parents=True)
+  (source/'package.json').write_text(json.dumps({'name':'typescript','version':'5.9.3'}))
+  clone=Path(self.temp.name)/'git-fixture';clone.mkdir()
+  # Reproduce Git ignore semantics without creating any commit or requiring a source .git.
+  subprocess.run(['git','init','--quiet',str(clone)],check=True,capture_output=True)
+  (clone/'.gitignore').write_bytes((ROOT/'.gitignore').read_bytes())
+  legacy={'name':'legacy-checker-fixture','lockfileVersion':3,'packages':{'':{'name':'legacy-checker-fixture','dependencies':{'typescript':'5.9.3'}},'node_modules/typescript':{'version':'5.9.3'}}}
+  (self.root/'package.json').write_text(json.dumps({'name':'legacy-checker-fixture','dependencies':{'typescript':'5.9.3'}}))
+  (self.root/'package-lock.json').write_text(json.dumps(legacy))
+  (clone/'package-lock.json').write_bytes((self.root/'package-lock.json').read_bytes())
+  names=ci.prepared_inventory(clone)
+  export.provision_node_modules(self.root,clone)
+  self.assertFalse((clone/'node_modules').is_symlink())
+  self.assertEqual(ci.prepared_inventory(clone),names)
+  self.assertEqual(subprocess.run(['git','check-ignore','-q','node_modules'],cwd=clone).returncode,0)
+ def test_metadata_exceptions_reject_appended_credentials(self):
+  patterns=tomllib.loads((ROOT/'.gitleaks.toml').read_text())['allowlist']['regexes']
+  lines=(ROOT/'catalogue/router_sources.json').read_text().splitlines()+[next(v for v in (ROOT/'tests/bootstrap/test_extract_rust.py').read_text().splitlines() if v.startswith('SOURCE_HASHES = ')),next(v for v in (ROOT/'requirements-ci.txt').read_text().splitlines() if re.fullmatch(r'\s*--hash=sha256:[a-f0-9]{64}\s*\\?\s*',v))]
+  for line in lines:
+   for prefix in ['', '\n']:
+    with self.subTest(metadata_shape=True,prefix=bool(prefix)):self.assertTrue(any(re.fullmatch(p,prefix+line) for p in patterns))
+    token='gh'+'p_'+secrets.token_hex(18)
+    with self.subTest(appended_credential=True,prefix=bool(prefix)):self.assertFalse(any(re.fullmatch(p,prefix+line+' '+token) for p in patterns))
+  secret='secret_'+'key = "'+secrets.token_hex(32)+'"'
+  self.assertFalse(any(re.fullmatch(p,secret) for p in patterns))
+
+
+ def test_router_receipt_pattern_supports_growth_and_rejects_invalid_values(self):
+  import build_cafe_nodes as B
+  patterns=tomllib.loads((ROOT/'.gitleaks.toml').read_text())['allowlist']['regexes']
+  receipt=json.loads((ROOT/'catalogue/router_sources.json').read_text())
+  def matches(value):
+   try:lines=B.encode_receipt(value).decode().splitlines()
+   except (KeyError,TypeError,ValueError):lines=json.dumps(value,sort_keys=True,separators=(',',':')).splitlines()
+   return bool(lines) and all(len(line.encode())<9000 and any(re.fullmatch(p,line) for p in patterns) for line in lines)
+  added='core/tests/journal_recovery.rs'
+  self.assertTrue((ROOT/added).is_file())
+  receipt['families']['rust-extra-journal-fixture']=added
+  receipt['sources'][added]=hashlib.sha256((ROOT/added).read_bytes()).hexdigest()
+  receipt['metadata']['README.md']=hashlib.sha256((ROOT/'README.md').read_bytes()).hexdigest()
+  receipt['tools']['tools/publication_lint.py']=hashlib.sha256((ROOT/'tools/publication_lint.py').read_bytes()).hexdigest()
+  self.assertTrue(matches(receipt))
+  for invalid in ['..'+'/escape.rs','/'+'outside.rs','C:'+chr(92)+'outside.rs','local/secret.txt','node_modules/cache.js','tools/../outside.rs','gh'+'p_'+secrets.token_hex(18)]:
+   bad=json.loads(json.dumps(receipt));bad['families']['bad']=invalid
+   with self.subTest(invalid_path_shape=True):self.assertFalse(matches(bad))
+  for invalid in ['0'*63,'0'*65,'g'*64,'gh'+'p_'+secrets.token_hex(18)]:
+   bad=json.loads(json.dumps(receipt));bad['sources'][added]=invalid
+   with self.subTest(invalid_digest_shape=True):self.assertFalse(matches(bad))
+  bad=json.loads(json.dumps(receipt));bad['secret_'+'key']='0'*64
+  self.assertFalse(matches(bad))
+  bad=json.loads(json.dumps(receipt));bad['sources']['secret_'+'key']='0'*64
+  self.assertFalse(matches(bad))
+
+
+if __name__=='__main__':unittest.main()

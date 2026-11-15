@@ -1,0 +1,170 @@
+use std::collections::BTreeMap;
+use serde::Serialize;
+use crate::capsule_registry::{Clock, Role, Registry, Envelope, Command, Outcome, SCHEMA};
+use crate::windows_window_registry::{WindowRegistry, WindowHandle, WindowView, WindowError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+// Trusted Rust boundary ONLY — do NOT derive or implement Deserialize!
+#[derive(Clone, Debug)]
+pub struct PairRequest {
+    pub request_id: String,
+    pub authority_epoch: Clock,
+    pub expected_revision: Clock,
+    pub capsule_id: String,
+    pub person_label: String,
+    pub feed_id: String,
+    pub role: Role,
+    pub window: WindowHandle,
+    pub window_generation: Clock,
+    pub layout_revision: Clock,
+    pub crop: Crop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Binding {
+    pub capsule_id: String,
+    pub person_label: String,
+    pub feed_id: String,
+    pub role: Role,
+    pub window: WindowHandle,
+    pub window_generation: Clock,
+    pub layout_revision: Clock,
+    pub crop: Crop,
+    pub feed_generation: Clock,
+}
+
+/// Immutable, single-use pairing candidate; only this module creates it.
+/// Main must durably admit envelope before committing its binding.
+pub(crate) struct PairProposal { envelope:Envelope, binding:Binding }
+impl PairProposal {pub(crate) fn envelope(&self)->&Envelope{&self.envelope}}
+
+pub struct PairingBook {
+    bindings: BTreeMap<String, Binding>,
+    /// Feeds paired on their whole window. Only these may follow a resize.
+    full_window: std::collections::BTreeSet<String>,
+}
+
+impl PairingBook {
+    pub fn new() -> Self {
+        Self {
+            bindings: BTreeMap::new(),
+            full_window: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub fn pair(
+        &mut self,
+        authority: &mut Registry,
+        windows: &WindowRegistry,
+        request: PairRequest,
+    ) -> Result<Binding, PairError> {
+        checked_pair(authority, windows, request, &mut self.bindings)
+    }
+
+    pub(crate) fn propose(&self,before:&crate::capsule_registry::Snapshot,windows:&WindowRegistry,request:PairRequest)->Result<PairProposal,PairError> {
+        if request.authority_epoch!=before.authority_epoch || request.expected_revision!=before.revision {return Err(PairError::AuthorityRejected("stale_pair_proposal".into()));}
+        let capsule=before.capsules.get(&request.capsule_id).ok_or(PairError::UnknownCapsule)?;
+        if capsule.person_label!=request.person_label{return Err(PairError::WrongPerson);}
+        if self.bindings.contains_key(&request.feed_id) || capsule.feeds.values().any(|feed|feed.role==request.role){return Err(PairError::AlreadyPaired);}
+        let view=windows.resolve(&request.window,request.window_generation)?;checked_crop(request.crop,&view,request.layout_revision)?;
+        let generation=Clock(before.highest_generation.0.checked_add(1).ok_or(PairError::GenerationExhausted)?);
+        let binding=Binding{capsule_id:request.capsule_id.clone(),person_label:request.person_label,feed_id:request.feed_id.clone(),role:request.role,window:request.window,window_generation:request.window_generation,layout_revision:request.layout_revision,crop:request.crop,feed_generation:generation};
+        let envelope=Envelope{schema:SCHEMA.into(),kind:"intent".into(),request_id:request.request_id,authority_epoch:request.authority_epoch,expected_revision:request.expected_revision,body:Command::AddFeed{capsule_id:request.capsule_id,feed_id:request.feed_id,role:request.role,generation}};
+        Ok(PairProposal{envelope,binding})
+    }
+    pub(crate) fn commit_proposed(&mut self,proposal:PairProposal,committed:&crate::capsule_registry::Snapshot,windows:&WindowRegistry)->Result<Binding,PairError> {
+        if committed.authority_epoch!=proposal.envelope.authority_epoch || proposal.envelope.expected_revision.0.checked_add(1)!=Some(committed.revision.0){return Err(PairError::AuthorityRejected("pair_not_committed".into()));}
+        let binding=proposal.binding;
+        if self.bindings.contains_key(&binding.feed_id){return Err(PairError::AlreadyPaired);}
+        let capsule=committed.capsules.get(&binding.capsule_id).ok_or(PairError::UnknownCapsule)?;
+        let feed=capsule.feeds.get(&binding.feed_id).ok_or(PairError::FeedUnavailable)?;
+        if capsule.person_label!=binding.person_label || feed.role!=binding.role || feed.generation!=binding.feed_generation{return Err(PairError::FeedUnavailable);}
+        let view=windows.resolve(&binding.window,binding.window_generation)?;checked_crop(binding.crop,&view,binding.layout_revision)?;
+        if binding.crop==(Crop{x:0,y:0,width:view.rect.width,height:view.rect.height}){self.full_window.insert(binding.feed_id.clone());}
+        self.bindings.insert(binding.feed_id.clone(),binding.clone());Ok(binding)
+    }
+    /// Forget a removed capsule's bindings; its window and recordings are untouched.
+    pub(crate) fn remove_capsule(&mut self,capsule_id:&str) {
+        let feeds:Vec<String>=self.bindings.values().filter(|binding|binding.capsule_id==capsule_id).map(|binding|binding.feed_id.clone()).collect();
+        for feed in feeds {self.bindings.remove(&feed);self.full_window.remove(&feed);}
+    }
+    /// A whole-window binding keeps covering the same window after a resize: no
+    /// new content becomes reachable. Chosen crops still need a new approval.
+    pub(crate) fn follow_window_resize(&mut self,windows:&WindowRegistry,busy:&std::collections::BTreeSet<String>)->bool {
+        let mut changed=false;
+        for feed in &self.full_window {
+            let Some(binding)=self.bindings.get_mut(feed) else{continue;};
+            if busy.contains(&binding.capsule_id){continue;}
+            let Ok(view)=windows.resolve(&binding.window,binding.window_generation) else{continue;};
+            if view.layout_revision==binding.layout_revision{continue;}
+            binding.layout_revision=view.layout_revision;binding.crop=Crop{x:0,y:0,width:view.rect.width,height:view.rect.height};changed=true;
+        }
+        changed
+    }
+
+    pub fn bindings(&self) -> Vec<Binding> {
+        self.bindings.values().cloned().collect()
+    }
+
+    pub fn current(
+        &self,
+        feed_id: &str,
+        authority: &Registry,
+        windows: &WindowRegistry,
+    ) -> Result<Binding, PairError> {
+        let binding = self
+            .bindings
+            .get(feed_id)
+            .ok_or(PairError::FeedUnavailable)?;
+        checked_binding(authority, windows, binding)
+    }
+
+    pub fn pair_by_executable(&self, _executable: &str) -> Result<(), PairError> {
+        Err(PairError::ExecutableOnlyForbidden)
+    }
+}
+
+// BEGIN CODEX PAIR ADMISSION — security-owned, preserved byte-exact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairError { Window(WindowError), WrongPerson, InvalidCrop, StaleCrop, UnknownCapsule, AlreadyPaired, FeedUnavailable, AuthorityRejected(String), GenerationExhausted, ExecutableOnlyForbidden }
+impl From<WindowError> for PairError { fn from(e: WindowError) -> Self { Self::Window(e) } }
+
+fn checked_crop(crop: Crop, view: &WindowView, layout: Clock) -> Result<(), PairError> {
+    if layout != view.layout_revision { return Err(PairError::StaleCrop); }
+    if crop.width == 0 || crop.height == 0 || crop.x.checked_add(crop.width).is_none_or(|x| x > view.rect.width)
+        || crop.y.checked_add(crop.height).is_none_or(|y| y > view.rect.height) { return Err(PairError::InvalidCrop); }
+    Ok(())
+}
+fn checked_pair(authority: &mut Registry, windows: &WindowRegistry, request: PairRequest, bindings: &mut BTreeMap<String, Binding>) -> Result<Binding, PairError> {
+    let before = authority.snapshot();
+    let capsule = before.capsules.get(&request.capsule_id).ok_or(PairError::UnknownCapsule)?;
+    if request.person_label != capsule.person_label { return Err(PairError::WrongPerson); }
+    let view = windows.resolve(&request.window, request.window_generation)?;
+    checked_crop(request.crop, &view, request.layout_revision)?;
+    if bindings.contains_key(&request.feed_id) { return Err(PairError::AlreadyPaired); }
+    let feed_generation = Clock(before.highest_generation.0.checked_add(1).ok_or(PairError::GenerationExhausted)?);
+    let binding = Binding { capsule_id: request.capsule_id.clone(), person_label: request.person_label.clone(), feed_id: request.feed_id.clone(),
+        role: request.role, window: request.window.clone(), window_generation: request.window_generation,
+        layout_revision: request.layout_revision, crop: request.crop, feed_generation };
+    let reply = authority.apply(Envelope { schema: SCHEMA.into(), kind: "intent".into(), request_id: request.request_id,
+        authority_epoch: request.authority_epoch, expected_revision: request.expected_revision,
+        body: Command::AddFeed { capsule_id: request.capsule_id, feed_id: request.feed_id.clone(), role: request.role, generation: feed_generation } });
+    if reply.state != Outcome::Admitted { return Err(PairError::AuthorityRejected(reply.error.unwrap_or_else(|| "rejected".into()))); }
+    bindings.insert(request.feed_id, binding.clone()); Ok(binding)
+}
+fn checked_binding(authority: &Registry, windows: &WindowRegistry, binding: &Binding) -> Result<Binding, PairError> {
+    let state = authority.snapshot();
+    let capsule = state.capsules.get(&binding.capsule_id).ok_or(PairError::FeedUnavailable)?;
+    let feed = capsule.feeds.get(&binding.feed_id).ok_or(PairError::FeedUnavailable)?;
+    if capsule.person_label != binding.person_label || feed.generation != binding.feed_generation || feed.role != binding.role { return Err(PairError::FeedUnavailable); }
+    let view = windows.resolve(&binding.window, binding.window_generation)?;
+    checked_crop(binding.crop, &view, binding.layout_revision)?; Ok(binding.clone())
+}
+// END CODEX PAIR ADMISSION

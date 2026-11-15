@@ -1,0 +1,1089 @@
+//! P06 authority append-only journal.
+//!
+//! Single-writer durable log of control and media receipts. Records are
+//! canonical JSON objects chained by SHA-256 digests and stored in
+//! length-prefixed frames with a commit trailer. Staging writes the frame
+//! header plus body; only `commit` appends the trailer and flushes, so a
+//! crash between the two reopens as a quarantined interrupted suffix.
+//!
+//! Recovery scanning lives here so both `Journal::open` and
+//! `journal_replay::recover` share one locked validator. Items shared with
+//! the replay module are `pub(crate)`; the unrestricted `pub` surface is
+//! exactly the specified unit interface.
+
+#![forbid(unsafe_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::capsule_registry::{Clock, Envelope, Outcome, Registry};
+
+/// Journal wire schema identifier.
+pub const JOURNAL_SCHEMA: &str = "cafe.journal.v1";
+
+/// Maximum canonical record body size in bytes.
+pub const MAX_RECORD_BYTES: usize = 1_048_576;
+
+/// Genesis prior digest for sequence 1: 64 lowercase ASCII zeros.
+const GENESIS_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Four-byte commit trailer terminating every durable frame.
+const TRAILER: &[u8] = b"CJOK";
+
+/// Process-wide staged-frame token source; every stage gets a unique id.
+static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Journal failure. Carries no paths or input excerpts.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JournalError {
+    Io,
+    Locked,
+    Corrupt,
+    Invalid,
+    Pending,
+    Media,
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            JournalError::Io => "journal_io",
+            JournalError::Locked => "journal_locked",
+            JournalError::Corrupt => "journal_corrupt",
+            JournalError::Invalid => "journal_invalid",
+            JournalError::Pending => "journal_pending",
+            JournalError::Media => "journal_media",
+        };
+        formatter.write_str(code)
+    }
+}
+
+impl std::error::Error for JournalError {}
+
+/// Durability state of an append token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppendState {
+    Pending,
+    Committed,
+}
+
+/// One hash-chained journal record: exactly nine wire fields.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Record {
+    pub schema: String,
+    pub session_id: String,
+    pub authority_epoch: Clock,
+    pub sequence: Clock,
+    pub event_id: String,
+    pub kind: String,
+    pub payload: Value,
+    pub prior_digest: String,
+    pub record_digest: String,
+}
+
+/// Pre-durable stage token. Not a receipt; proves nothing durable.
+#[derive(Debug)]
+pub struct Pending {
+    stage_id: u64,
+    event_id: String,
+}
+
+impl Pending {
+    pub fn state(&self) -> AppendState {
+        AppendState::Pending
+    }
+}
+
+/// Durable commit receipt. Constructible only through `Journal::commit`
+/// (or the atomic append helpers) after the frame trailer is flushed.
+#[derive(Debug)]
+pub struct Committed {
+    sequence: Clock,
+    event_id: String,
+    record_digest: String,
+}
+
+impl Committed {
+    pub fn state(&self) -> AppendState {
+        AppendState::Committed
+    }
+
+    pub fn sequence(&self) -> Clock {
+        self.sequence
+    }
+
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub fn record_digest(&self) -> &str {
+        &self.record_digest
+    }
+}
+
+/// Exact `media_intent` payload: `{media_id, name}` and nothing else.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaIntentPayload {
+    media_id: String,
+    name: String,
+}
+
+/// Exact `media_published` payload: `{byte_len, media_id, name, sha256}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaPublishedPayload {
+    byte_len: Clock,
+    media_id: String,
+    name: String,
+    sha256: String,
+}
+
+/// Closed operator-control journal facts. No confirmation token or folder plaintext.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlOperation { SetFolder, StartRecording, StopRecording, SendToObs }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlIntentRecord {
+    pub request_id: String,
+    pub identity_sha256: String,
+    pub operation: ControlOperation,
+    pub args_sha256: String,
+    pub capsule_id: Option<String>,
+    pub expected_revision: Clock,
+    pub effect_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlCompletion { Committed, Interrupted }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlResultRecord {
+    pub request_id: String,
+    pub effect_id: String,
+    pub state: ControlCompletion,
+}
+
+type ControlBook = BTreeMap<String, (ControlIntentRecord, Option<ControlResultRecord>)>;
+
+fn control_identifier(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 96 && text.as_bytes()[0].is_ascii_alphanumeric()
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+
+fn apply_control_fact(kind: &str, payload: &Value, sequence: Clock, book: &mut ControlBook, registry: &Registry) -> Result<(), JournalError> {
+    let object = payload.as_object().ok_or(JournalError::Corrupt)?;
+    match kind {
+        "confirmed_control_intent" => {
+            let expected = ["request_id", "identity_sha256", "operation", "args_sha256", "capsule_id", "expected_revision", "effect_id"];
+            if object.len() != expected.len() || expected.iter().any(|k| !object.contains_key(*k)) { return Err(JournalError::Corrupt); }
+            let intent: ControlIntentRecord = serde_json::from_value(payload.clone()).map_err(|_| JournalError::Corrupt)?;
+            if !control_identifier(&intent.request_id) || !control_identifier(&intent.effect_id)
+                || !is_lower_hex_64(&intent.identity_sha256) || !is_lower_hex_64(&intent.args_sha256)
+                || intent.effect_id != format!("ctl.{}", sha256_hex(intent.request_id.as_bytes()))
+                || intent.expected_revision.0.checked_add(1) != Some(sequence.0)
+                || book.contains_key(&intent.request_id) { return Err(JournalError::Corrupt); }
+            match (&intent.operation, &intent.capsule_id) {
+                (ControlOperation::SetFolder, None) => {},
+                (ControlOperation::StartRecording | ControlOperation::StopRecording | ControlOperation::SendToObs, Some(id)) if control_identifier(id) && registry.snapshot().capsules.contains_key(id) => {},
+                _ => return Err(JournalError::Corrupt),
+            }
+            book.insert(intent.request_id.clone(), (intent, None));
+        },
+        "confirmed_control_result" => {
+            if object.len() != 3 || ["request_id", "effect_id", "state"].iter().any(|k| !object.contains_key(*k)) { return Err(JournalError::Corrupt); }
+            let result: ControlResultRecord = serde_json::from_value(payload.clone()).map_err(|_| JournalError::Corrupt)?;
+            let Some((intent, prior)) = book.get_mut(&result.request_id) else { return Err(JournalError::Corrupt); };
+            if prior.is_some() || result.effect_id != intent.effect_id { return Err(JournalError::Corrupt); }
+            *prior = Some(result);
+        },
+        _ => return Err(JournalError::Corrupt),
+    }
+    Ok(())
+}
+
+/// In-memory staged frame awaiting its commit trailer.
+struct StagedControl {
+    stage_id: u64,
+    event_id: String,
+    record: Record,
+    envelope: Envelope,
+}
+
+/// Outcome of scanning the on-disk prefix during `open`.
+struct Scan {
+    records: Vec<Record>,
+    registry: Registry,
+    event_ids: BTreeSet<String>,
+    media_intents: BTreeMap<String, String>,
+    media_published: BTreeSet<String>,
+    prefix_len: usize,
+    suffix: Vec<u8>,
+}
+
+/// Exclusive single-writer journal handle. Holds the locked file for its
+/// whole lifetime; dropping releases the persistent sidecar lock.
+pub struct Journal {
+    durability: Durability,
+    file: File,
+    path: PathBuf,
+    session_id: String,
+    epoch: Clock,
+    records: Vec<Record>,
+    registry: Registry,
+    event_ids: BTreeSet<String>,
+    media_intents: BTreeMap<String, String>,
+    media_published: BTreeSet<String>,
+    status: crate::journal_replay::RecoveryStatus,
+    interrupted: Vec<u8>,
+    staged: Option<StagedControl>,
+    poisoned: bool,
+    // Last field: release exclusivity only after closing the data handle. Never unlink.
+    _writer_lock: File,
+}
+
+/// Canonical JSON bytes: recursively sorted object keys, compact UTF-8,
+/// integers in decimal form. Any floating-point number anywhere fails.
+pub fn canonical_bytes(value: &Value) -> Result<Vec<u8>, JournalError> {
+    let sorted = sort_value(value)?;
+    serde_json::to_vec(&sorted).map_err(|_| JournalError::Invalid)
+}
+
+/// Lowercase hexadecimal SHA-256 digest of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    out
+}
+
+/// Safe publication name: one normal relative path component, no
+/// separators, no dot segments, no NUL.
+pub(crate) fn is_safe_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => true,
+        _ => false,
+    }
+}
+
+/// Recursively sorts object keys; rejects every float number.
+fn sort_value(value: &Value) -> Result<Value, JournalError> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => Ok(value.clone()),
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                Ok(value.clone())
+            } else {
+                Err(JournalError::Invalid)
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(sort_value(item)?);
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, item) in entries {
+                out.insert(key.clone(), sort_value(item)?);
+            }
+            Ok(Value::Object(out))
+        }
+    }
+}
+
+/// True for exactly 64 lowercase hexadecimal characters.
+fn is_lower_hex_64(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Serializes a record to its nine-field JSON value.
+fn record_value(record: &Record) -> Result<Value, JournalError> {
+    serde_json::to_value(record).map_err(|_| JournalError::Invalid)
+}
+
+/// Digest over the eight-field preimage (full record minus
+/// the self-referential `record_digest`, including `prior_digest`).
+fn digest_of_preimage(record: &Record) -> Result<String, JournalError> {
+    let mut value = record_value(record)?;
+    match &mut value {
+        Value::Object(map) => {
+            map.remove("record_digest");
+        }
+        _ => return Err(JournalError::Invalid),
+    }
+    let bytes = canonical_bytes(&value)?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// All regular-file handles passed here were opened with write access.
+/// Unix also uses this wrapper for its existing read-only directory fsync.
+fn flush_handle(file: &File) -> Result<(), JournalError> {
+    file.sync_all().map_err(|_| JournalError::Io)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum DurabilityFault { File, Parent, Directory }
+
+#[derive(Default)]
+struct Durability {
+    #[cfg(test)]
+    fault: Option<DurabilityFault>,
+    #[cfg(test)]
+    directory_flushes: usize,
+}
+
+impl Durability {
+    fn flush(&mut self, file: &File) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.fault == Some(DurabilityFault::File) { return Err(JournalError::Io); }
+        flush_handle(file)
+    }
+    fn regular_file(&mut self, path: &Path) -> Result<(), JournalError> {
+        let file = OpenOptions::new().write(true).open(path).map_err(|_| JournalError::Io)?;
+        self.flush(&file)
+    }
+    fn parent(&mut self, path: &Path) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.fault == Some(DurabilityFault::Parent) { return Err(JournalError::Io); }
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        self.parent_platform(parent)
+    }
+    #[cfg(unix)]
+    fn parent_platform(&mut self, parent: &Path) -> Result<(), JournalError> {
+        let directory = File::open(parent).map_err(|_| JournalError::Io)?;
+        #[cfg(test)]
+        if self.fault == Some(DurabilityFault::Directory) { return Err(JournalError::Io); }
+        flush_handle(&directory)?;
+        #[cfg(test)]
+        { self.directory_flushes += 1; }
+        Ok(())
+    }
+    #[cfg(windows)]
+    fn parent_platform(&mut self, parent: &Path) -> Result<(), JournalError> {
+        crate::windows_journal_policy::require_ntfs_directory(parent)
+    }
+    #[cfg(not(any(unix, windows)))]
+    fn parent_platform(&mut self, _parent: &Path) -> Result<(), JournalError> {
+        Err(JournalError::Io)
+    }
+}
+
+/// Required parent policy; never map an unsupported-platform failure to success.
+fn sync_parent_dir(path: &Path) -> Result<(), JournalError> {
+    Durability::default().parent(path)
+}
+
+fn publish_rename(source: &Path, target: &Path) -> Result<(), JournalError> {
+    #[cfg(windows)]
+    { crate::windows_journal_policy::publish_no_replace(source, target) }
+    #[cfg(not(windows))]
+    { std::fs::rename(source, target).map_err(|_| JournalError::Io) }
+}
+
+/// Scans frames from offset zero, fully validating every complete record
+/// (framing, canonical bytes, chain, replay) before reporting a torn tail.
+/// Any complete corrupt frame aborts with `Corrupt` and no side effects.
+fn scan_prefix(
+    bytes: &[u8],
+    session_id: &str,
+    epoch: Clock,
+) -> Result<Scan, JournalError> {
+    let mut records = Vec::new();
+    let mut registry = Registry::new(epoch);
+    let mut event_ids = BTreeSet::new();
+    let mut media_intents = BTreeMap::new();
+    let mut media_published = BTreeSet::new();
+    let mut control_book = BTreeMap::new();
+    let mut offset = 0usize;
+    let mut expected_sequence: u64 = 1;
+    let mut expected_prior = GENESIS_DIGEST.to_string();
+    loop {
+        let remaining = bytes.len() - offset;
+        if remaining == 0 {
+            return Ok(Scan {
+                records,
+                registry,
+                event_ids,
+                media_intents,
+                media_published,
+                prefix_len: offset,
+                suffix: Vec::new(),
+            });
+        }
+        if remaining < 8 {
+            return Ok(Scan {
+                records,
+                registry,
+                event_ids,
+                media_intents,
+                media_published,
+                prefix_len: offset,
+                suffix: bytes[offset..].to_vec(),
+            });
+        }
+        let length = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        let complement = u32::from_be_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        if complement != !length || length == 0 || length as usize > MAX_RECORD_BYTES
+        {
+            return Err(JournalError::Corrupt);
+        }
+        let body_len = length as usize;
+        let total = 8usize + body_len + 4;
+        if remaining < total {
+            return Ok(Scan {
+                records,
+                registry,
+                event_ids,
+                media_intents,
+                media_published,
+                prefix_len: offset,
+                suffix: bytes[offset..].to_vec(),
+            });
+        }
+        let body = &bytes[offset + 8..offset + 8 + body_len];
+        let trailer = &bytes[offset + 8 + body_len..offset + 8 + body_len + 4];
+        if trailer != TRAILER {
+            return Err(JournalError::Corrupt);
+        }
+        let record = validate_record(
+            body,
+            session_id,
+            epoch,
+            expected_sequence,
+            &expected_prior,
+            &mut registry,
+            &mut event_ids,
+            &mut media_intents,
+            &mut media_published,
+            &mut control_book,
+        )?;
+        expected_prior = record.record_digest.clone();
+        records.push(record);
+        expected_sequence =
+            expected_sequence.checked_add(1).ok_or(JournalError::Corrupt)?;
+        offset += total;
+    }
+}
+
+/// Validates one complete record body: canonical bytes equal the stored
+/// bytes, fields and hash chain match, and the payload applies cleanly.
+fn validate_record(
+    body: &[u8],
+    session_id: &str,
+    epoch: Clock,
+    expected_sequence: u64,
+    expected_prior: &str,
+    registry: &mut Registry,
+    event_ids: &mut BTreeSet<String>,
+    media_intents: &mut BTreeMap<String, String>,
+    media_published: &mut BTreeSet<String>,
+    control_book: &mut ControlBook,
+) -> Result<Record, JournalError> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| JournalError::Corrupt)?;
+    let canonical = canonical_bytes(&parsed).map_err(|_| JournalError::Corrupt)?;
+    if canonical.as_slice() != body {
+        return Err(JournalError::Corrupt);
+    }
+    let record: Record =
+        serde_json::from_value(parsed.clone()).map_err(|_| JournalError::Corrupt)?;
+    if record.schema != JOURNAL_SCHEMA {
+        return Err(JournalError::Corrupt);
+    }
+    if record.session_id.is_empty() || record.session_id != session_id {
+        return Err(JournalError::Corrupt);
+    }
+    if record.authority_epoch != epoch {
+        return Err(JournalError::Corrupt);
+    }
+    if record.sequence != Clock(expected_sequence) {
+        return Err(JournalError::Corrupt);
+    }
+    if record.event_id.is_empty() {
+        return Err(JournalError::Corrupt);
+    }
+    if !event_ids.insert(record.event_id.clone()) {
+        return Err(JournalError::Corrupt);
+    }
+    if record.prior_digest != expected_prior {
+        return Err(JournalError::Corrupt);
+    }
+    let preimage = match parsed {
+        Value::Object(mut map) => {
+            map.remove("record_digest");
+            Value::Object(map)
+        }
+        _ => return Err(JournalError::Corrupt),
+    };
+    let preimage_bytes =
+        canonical_bytes(&preimage).map_err(|_| JournalError::Corrupt)?;
+    if sha256_hex(&preimage_bytes) != record.record_digest {
+        return Err(JournalError::Corrupt);
+    }
+    match record.kind.as_str() {
+        "service_configuration" => {
+            let Some(body) = record.payload.as_object() else { return Err(JournalError::Corrupt); };
+            if body.len()!=2 || !matches!(body.get("service").and_then(Value::as_str),Some("obs"|"chat"))
+                || !body.get("secret_present").is_some_and(Value::is_boolean)
+                || (body["service"]=="chat" && body["secret_present"]!=Value::Bool(false)) {
+                return Err(JournalError::Corrupt);
+            }
+        }
+        "confirmed_control_intent" | "confirmed_control_result" => {
+            apply_control_fact(&record.kind, &record.payload, record.sequence, control_book, registry)?;
+        }
+        "control" => {
+            let envelope: Envelope = serde_json::from_value(record.payload.clone())
+                .map_err(|_| JournalError::Corrupt)?;
+            if registry.apply(envelope).state != Outcome::Admitted {
+                return Err(JournalError::Corrupt);
+            }
+        }
+        "media_intent" => {
+            let intent: MediaIntentPayload =
+                serde_json::from_value(record.payload.clone())
+                    .map_err(|_| JournalError::Corrupt)?;
+            if intent.media_id.is_empty() || !is_safe_name(&intent.name) {
+                return Err(JournalError::Corrupt);
+            }
+            if media_intents.insert(intent.media_id, intent.name).is_some() {
+                return Err(JournalError::Corrupt);
+            }
+        }
+        "media_published" => {
+            let receipt: MediaPublishedPayload =
+                serde_json::from_value(record.payload.clone())
+                    .map_err(|_| JournalError::Corrupt)?;
+            if receipt.byte_len == Clock(0) || !is_lower_hex_64(&receipt.sha256) {
+                return Err(JournalError::Corrupt);
+            }
+            if !is_safe_name(&receipt.name) {
+                return Err(JournalError::Corrupt);
+            }
+            match media_intents.get(&receipt.media_id) {
+                Some(name) if *name == receipt.name => {}
+                _ => return Err(JournalError::Corrupt),
+            }
+            if !media_published.insert(receipt.media_id) {
+                return Err(JournalError::Corrupt);
+            }
+        }
+        _ => return Err(JournalError::Corrupt),
+    }
+    Ok(record)
+}
+
+/// Creates the quarantine sidecar next to the journal with `create_new`,
+/// falling back to deterministic numbered siblings when taken.
+fn create_sidecar(path: &Path) -> Result<File, JournalError> {
+    let first = path.with_extension("interrupted");
+    match OpenOptions::new().write(true).create_new(true).open(&first) {
+        Ok(file) => return Ok(file),
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(JournalError::Io);
+        }
+        Err(_) => {}
+    }
+    let mut counter: u32 = 1;
+    loop {
+        let candidate = path.with_extension(format!("interrupted.{counter}"));
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(JournalError::Io);
+            }
+            Err(_) => {}
+        }
+        counter = counter.checked_add(1).ok_or(JournalError::Io)?;
+    }
+}
+
+impl Journal {
+    #[cfg(test)]
+    pub(crate) fn inject_durability_fault(&mut self, fault: DurabilityFault) {
+        self.durability.fault = Some(fault);
+    }
+    #[cfg(test)]
+    pub(crate) fn has_pending_stage(&self) -> bool { self.staged.is_some() }
+    #[cfg(test)]
+    pub(crate) fn directory_flush_count(&self) -> usize { self.durability.directory_flushes }
+    /// Opens or creates the journal, takes the exclusive lock, validates
+    /// the committed prefix, and quarantines a torn final suffix.
+    pub fn open(path: &Path, session_id: &str, epoch: Clock) -> Result<Self, JournalError> {
+        if session_id.is_empty() {
+            return Err(JournalError::Invalid);
+        }
+        // A separate inode keeps Windows mandatory locks away from data readers.
+        // Append to the complete name; replacing its extension would alias journals.
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let writer_lock = OpenOptions::new().read(true).write(true).create(true)
+            .open(PathBuf::from(lock_name)).map_err(|_| JournalError::Io)?;
+        writer_lock.try_lock().map_err(|_| JournalError::Locked)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|_| JournalError::Io)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|_| JournalError::Io)?;
+        let scan = scan_prefix(&bytes, session_id, epoch)?;
+        let (status, interrupted) = if scan.suffix.is_empty() {
+            (crate::journal_replay::RecoveryStatus::Clean, Vec::new())
+        } else {
+            let mut sidecar = create_sidecar(path)?;
+            sidecar.write_all(&scan.suffix).map_err(|_| JournalError::Io)?;
+            flush_handle(&sidecar)?;
+            sync_parent_dir(path)?;
+            file.set_len(scan.prefix_len as u64).map_err(|_| JournalError::Io)?;
+            flush_handle(&file)?;
+            (
+                crate::journal_replay::RecoveryStatus::Interrupted,
+                scan.suffix,
+            )
+        };
+        file.seek(SeekFrom::End(0)).map_err(|_| JournalError::Io)?;
+        Ok(Journal {
+            durability: Durability::default(),
+            file,
+            path: path.to_path_buf(),
+            session_id: session_id.to_string(),
+            epoch,
+            records: scan.records,
+            registry: scan.registry,
+            event_ids: scan.event_ids,
+            media_intents: scan.media_intents,
+            media_published: scan.media_published,
+            status,
+            interrupted,
+            staged: None,
+            poisoned: false,
+            _writer_lock: writer_lock,
+        })
+    }
+
+    /// Validates a control request against the durable ledger and writes
+    /// the frame header plus body without the commit trailer or receipt.
+    pub fn stage_control(
+        &mut self,
+        event_id: &str,
+        request: Envelope,
+    ) -> Result<Pending, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Io);
+        }
+        if self.staged.is_some() {
+            return Err(JournalError::Pending);
+        }
+        if event_id.is_empty() || self.event_ids.contains(event_id) {
+            return Err(JournalError::Invalid);
+        }
+        let mut scratch = Registry::new(self.epoch);
+        for record in &self.records {
+            if record.kind == "control" {
+                let envelope: Envelope = serde_json::from_value(record.payload.clone())
+                    .map_err(|_| JournalError::Corrupt)?;
+                if scratch.apply(envelope).state != Outcome::Admitted {
+                    return Err(JournalError::Corrupt);
+                }
+            }
+        }
+        if scratch.apply(request.clone()).state != Outcome::Admitted {
+            return Err(JournalError::Invalid);
+        }
+        let payload =
+            serde_json::to_value(&request).map_err(|_| JournalError::Invalid)?;
+        let (record, body) = self.build_record(event_id, "control", payload)?;
+        let length = body.len() as u32;
+        let mut frame = Vec::with_capacity(8 + body.len());
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&(!length).to_be_bytes());
+        frame.extend_from_slice(&body);
+        if self.file.write_all(&frame).is_err() {
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        let stage_id = NEXT_STAGE_ID.fetch_add(1, Ordering::SeqCst);
+        self.staged = Some(StagedControl {
+            stage_id,
+            event_id: event_id.to_string(),
+            record,
+            envelope: request,
+        });
+        Ok(Pending {
+            stage_id,
+            event_id: event_id.to_string(),
+        })
+    }
+
+    /// Appends the commit trailer, flushes, and only then advances the
+    /// durable ledger and returns the receipt.
+    pub fn commit(&mut self, pending: Pending) -> Result<Committed, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Io);
+        }
+        let staged = match self.staged.take() {
+            Some(staged) => staged,
+            None => return Err(JournalError::Pending),
+        };
+        if staged.stage_id != pending.stage_id || staged.event_id != pending.event_id
+        {
+            self.staged = Some(staged);
+            return Err(JournalError::Pending);
+        }
+        if self.file.write_all(TRAILER).is_err() {
+            self.staged = Some(staged);
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        if self.durability.flush(&self.file).is_err() {
+            self.staged = Some(staged);
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        if self.durability.parent(&self.path).is_err() {
+            self.staged = Some(staged);
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        if self.registry.apply(staged.envelope).state != Outcome::Admitted {
+            self.poisoned = true;
+            return Err(JournalError::Corrupt);
+        }
+        self.event_ids.insert(staged.record.event_id.clone());
+        let committed = Committed {
+            sequence: staged.record.sequence,
+            event_id: staged.record.event_id.clone(),
+            record_digest: staged.record.record_digest.clone(),
+        };
+        self.records.push(staged.record);
+        Ok(committed)
+    }
+
+    /// Stages and commits one control record.
+    pub fn append_control(
+        &mut self,
+        event_id: &str,
+        request: Envelope,
+    ) -> Result<Committed, JournalError> {
+        let pending = self.stage_control(event_id, request)?;
+        self.commit(pending)
+    }
+
+    pub(crate) fn authority_epoch(&self) -> Clock { self.epoch }
+
+    pub(crate) fn has_service_configuration(&self, request_id:&str)->bool {
+        self.event_ids.contains(&format!("service-config.{}",sha256_hex(request_id.as_bytes())))
+    }
+
+    /// Only service identity and secret presence are durable. Credentials,
+    /// channel names, descriptors, and chat payloads are not accepted here.
+    pub(crate) fn append_service_configuration(&mut self, request_id:&str, service:&str, secret_present:bool)->Result<Committed,JournalError> {
+        if self.poisoned{return Err(JournalError::Io);}
+        if self.staged.is_some(){return Err(JournalError::Pending);}
+        if !control_identifier(request_id)||!matches!(service,"obs"|"chat")||(service=="chat"&&secret_present)
+            ||self.has_service_configuration(request_id)
+            ||self.records.iter().any(|r|r.payload.get("request_id").and_then(Value::as_str)==Some(request_id)) {
+            return Err(JournalError::Invalid);
+        }
+        let event=format!("service-config.{}",sha256_hex(request_id.as_bytes()));
+        let payload=serde_json::json!({"service":service,"secret_present":secret_present});
+        let (record,body)=self.build_record(&event,"service_configuration",payload)?;
+        self.write_committed_frame(&body)?;
+        self.event_ids.insert(event.clone());
+        let receipt=Committed{sequence:record.sequence,event_id:event,record_digest:record.record_digest.clone()};
+        self.records.push(record);Ok(receipt)
+    }
+
+    /// Appends a closed confirmed intent only after durable flush; no effect is dispatched here.
+    pub(crate) fn append_confirmed_intent(&mut self, intent: ControlIntentRecord) -> Result<Committed, JournalError> {
+        let event = format!("intent.{}", sha256_hex(intent.request_id.as_bytes()));
+        let payload = serde_json::to_value(intent).map_err(|_| JournalError::Invalid)?;
+        self.append_control_fact(&event, "confirmed_control_intent", payload)
+    }
+
+    /// Appends a closed outcome only after the corresponding durable intent.
+    pub(crate) fn append_confirmed_result(&mut self, result: ControlResultRecord) -> Result<Committed, JournalError> {
+        let event = format!("result.{}", sha256_hex(result.request_id.as_bytes()));
+        let payload = serde_json::to_value(result).map_err(|_| JournalError::Invalid)?;
+        self.append_control_fact(&event, "confirmed_control_result", payload)
+    }
+
+    fn append_control_fact(&mut self, event: &str, kind: &str, payload: Value) -> Result<Committed, JournalError> {
+        if self.poisoned { return Err(JournalError::Io); }
+        if self.staged.is_some() { return Err(JournalError::Pending); }
+        if self.event_ids.contains(event) { return Err(JournalError::Invalid); }
+        let mut book = BTreeMap::new();
+        for record in &self.records {
+            if matches!(record.kind.as_str(), "confirmed_control_intent" | "confirmed_control_result") {
+                apply_control_fact(&record.kind, &record.payload, record.sequence, &mut book, &self.registry)?;
+            }
+        }
+        apply_control_fact(kind, &payload, self.next_sequence()?, &mut book, &self.registry).map_err(|_| JournalError::Invalid)?;
+        let (record, body) = self.build_record(event, kind, payload)?;
+        self.write_committed_frame(&body)?;
+        self.event_ids.insert(event.to_owned());
+        let receipt = Committed { sequence: record.sequence, event_id: event.to_owned(), record_digest: record.record_digest.clone() };
+        self.records.push(record);
+        Ok(receipt)
+    }
+
+    /// Commits a typed media intent for a new media id.
+    pub fn append_media_intent(
+        &mut self,
+        event_id: &str,
+        media_id: &str,
+        published_name: &str,
+    ) -> Result<Committed, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Io);
+        }
+        if self.staged.is_some() {
+            return Err(JournalError::Pending);
+        }
+        if event_id.is_empty() || self.event_ids.contains(event_id) {
+            return Err(JournalError::Invalid);
+        }
+        if media_id.is_empty() || self.media_intents.contains_key(media_id) {
+            return Err(JournalError::Invalid);
+        }
+        if !is_safe_name(published_name) {
+            return Err(JournalError::Media);
+        }
+        let payload = serde_json::to_value(MediaIntentPayload {
+            media_id: media_id.to_string(),
+            name: published_name.to_string(),
+        })
+        .map_err(|_| JournalError::Invalid)?;
+        let (record, body) = self.build_record(event_id, "media_intent", payload)?;
+        self.write_committed_frame(&body)?;
+        self.event_ids.insert(record.event_id.clone());
+        self.media_intents.insert(media_id.to_string(), published_name.to_string());
+        let committed = Committed {
+            sequence: record.sequence,
+            event_id: record.event_id.clone(),
+            record_digest: record.record_digest.clone(),
+        };
+        self.records.push(record);
+        Ok(committed)
+    }
+
+    /// Validates and publishes a staged media file under its intent name
+    /// without clobbering, then commits the publication receipt.
+    pub fn publish_media(
+        &mut self,
+        event_id: &str,
+        media_root: &Path,
+        media_id: &str,
+        staged_name: &str,
+    ) -> Result<Committed, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Io);
+        }
+        if self.staged.is_some() {
+            return Err(JournalError::Pending);
+        }
+        if event_id.is_empty() || self.event_ids.contains(event_id) {
+            return Err(JournalError::Invalid);
+        }
+        let published_name = match self.media_intents.get(media_id) {
+            Some(name) => name.clone(),
+            None => return Err(JournalError::Media),
+        };
+        if self.media_published.contains(media_id) {
+            return Err(JournalError::Media);
+        }
+        if !is_safe_name(staged_name) || !is_safe_name(&published_name) {
+            return Err(JournalError::Media);
+        }
+        let root_meta =
+            std::fs::symlink_metadata(media_root).map_err(|_| JournalError::Media)?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            return Err(JournalError::Media);
+        }
+        #[cfg(windows)]
+        crate::windows_journal_policy::require_ntfs_directory(media_root)?;
+        let staged_path = media_root.join(staged_name);
+        let staged_meta =
+            std::fs::symlink_metadata(&staged_path).map_err(|_| JournalError::Media)?;
+        if staged_meta.file_type().is_symlink() || !staged_meta.is_file() {
+            return Err(JournalError::Media);
+        }
+        if staged_meta.len() == 0 {
+            return Err(JournalError::Media);
+        }
+        let bytes = std::fs::read(&staged_path).map_err(|_| JournalError::Io)?;
+        if bytes.is_empty() {
+            return Err(JournalError::Media);
+        }
+        let byte_len = Clock(bytes.len() as u64);
+        let sha256 = sha256_hex(&bytes);
+        self.durability.regular_file(&staged_path)?;
+        let target_path = media_root.join(&published_name);
+        if staged_name != published_name {
+            match std::fs::symlink_metadata(&target_path) {
+                Ok(_) => return Err(JournalError::Media),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(JournalError::Io),
+            }
+            publish_rename(&staged_path, &target_path)?;
+            self.durability.regular_file(&target_path)?;
+            self.durability.parent(&target_path)?;
+        }
+        let payload = serde_json::to_value(MediaPublishedPayload {
+            byte_len,
+            media_id: media_id.to_string(),
+            name: published_name,
+            sha256,
+        })
+        .map_err(|_| JournalError::Invalid)?;
+        let (record, body) = self.build_record(event_id, "media_published", payload)?;
+        self.write_committed_frame(&body)?;
+        self.event_ids.insert(record.event_id.clone());
+        self.media_published.insert(media_id.to_string());
+        let committed = Committed {
+            sequence: record.sequence,
+            event_id: record.event_id.clone(),
+            record_digest: record.record_digest.clone(),
+        };
+        self.records.push(record);
+        Ok(committed)
+    }
+
+    /// Durable committed records only; excludes any staged frame.
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    /// Recovery outcome observed while opening.
+    pub fn recovery_status(&self) -> crate::journal_replay::RecoveryStatus {
+        self.status
+    }
+
+    /// Exact quarantined suffix bytes from opening; empty when clean.
+    pub fn interrupted_bytes(&self) -> &[u8] {
+        &self.interrupted
+    }
+
+    /// Owned observation of the durable control ledger for replay.
+    pub(crate) fn snapshot(&self) -> crate::capsule_registry::Snapshot {
+        self.registry.snapshot()
+    }
+
+    /// Next sequence: exactly one past the last committed record.
+    fn next_sequence(&self) -> Result<Clock, JournalError> {
+        match self.records.last() {
+            None => Ok(Clock(1)),
+            Some(last) => last
+                .sequence
+                .0
+                .checked_add(1)
+                .map(Clock)
+                .ok_or(JournalError::Invalid),
+        }
+    }
+
+    /// Prior digest chaining to the last committed record, else genesis.
+    fn prior_digest(&self) -> String {
+        self.records
+            .last()
+            .map(|record| record.record_digest.clone())
+            .unwrap_or_else(|| GENESIS_DIGEST.to_string())
+    }
+
+    /// Builds a fully digested record plus its bounded canonical body.
+    fn build_record(
+        &self,
+        event_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<(Record, Vec<u8>), JournalError> {
+        let mut record = Record {
+            schema: JOURNAL_SCHEMA.to_string(),
+            session_id: self.session_id.clone(),
+            authority_epoch: self.epoch,
+            sequence: self.next_sequence()?,
+            event_id: event_id.to_string(),
+            kind: kind.to_string(),
+            payload,
+            prior_digest: self.prior_digest(),
+            record_digest: String::new(),
+        };
+        record.record_digest = digest_of_preimage(&record)?;
+        let body = canonical_bytes(&record_value(&record)?)?;
+        if body.len() > MAX_RECORD_BYTES {
+            return Err(JournalError::Invalid);
+        }
+        Ok((record, body))
+    }
+
+    /// Writes one complete frame (header, body, trailer) and flushes it
+    /// durably; poisons the handle on any uncertain failure.
+    fn write_committed_frame(&mut self, body: &[u8]) -> Result<(), JournalError> {
+        let length = body.len() as u32;
+        let mut frame = Vec::with_capacity(8 + body.len() + 4);
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&(!length).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame.extend_from_slice(TRAILER);
+        if self.file.write_all(&frame).is_err() {
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        if self.durability.flush(&self.file).is_err() {
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        if self.durability.parent(&self.path).is_err() {
+            self.poisoned = true;
+            return Err(JournalError::Io);
+        }
+        Ok(())
+    }
+}
